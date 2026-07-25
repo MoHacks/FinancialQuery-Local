@@ -1,5 +1,6 @@
 *.pdf
 *.txt
 *.png
+*.json
 shrinkPage.py
 isolatePage.py
