@@ -13,7 +13,7 @@ Requirements:
     pip install pdf2image requests tqdm --break-system-packages
     brew install poppler
     ollama pull qwen2.5vl:7b   # vision model, reads the statement image
-    ollama pull qwen2.5:3b     # small text model, classifies each row
+    ollama pull qwen2.5:7b     # small text model, classifies each row
 """
 
 import sys
@@ -44,7 +44,7 @@ print("[DEBUG L39] set VISION_MODEL")
 # A small text-only model is enough for a one-line classification judgment
 # and runs much faster than the vision model since there's no image to
 # process. Swap for whatever lightweight text model you have pulled.
-CLASSIFY_MODEL = "qwen2.5:3b"
+CLASSIFY_MODEL = "qwen2.5:7b"
 print("[DEBUG L44] set CLASSIFY_MODEL")
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
