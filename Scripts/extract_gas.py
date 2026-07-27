@@ -1,10 +1,10 @@
 """
 extract_gas.py
 
-Reads a single-page statement PDF (table-format transaction records),
-transcribes every row using a local Qwen2.5-VL model via Ollama, then
-classifies each row as gas/fuel-related using a second, lightweight
-local text model's judgment (no hardcoded keyword list).
+Reads a multi-page statement PDF (table-format transaction records),
+transcribes every row on every page using a local Qwen2.5-VL model via
+Ollama, then classifies each row as gas/fuel-related using a second,
+lightweight local text model's judgment (no hardcoded keyword list).
 
 Usage:
     python3 extract_gas.py february_statement.pdf
@@ -12,8 +12,8 @@ Usage:
 Requirements:
     pip install pdf2image requests tqdm --break-system-packages
     brew install poppler
-    ollama pull qwen2.5vl:7b   # vision model, reads the statement image
-    ollama pull qwen2.5:7b     # small text model, classifies each row
+    ollama pull qwen2.5vl:7b   # vision model, reads each statement page
+    ollama pull qwen2.5:7b     # text model, classifies each row
 """
 
 import sys
@@ -26,6 +26,8 @@ import time
 print("[DEBUG L24] imported time")
 from io import BytesIO
 print("[DEBUG L26] imported BytesIO")
+from datetime import datetime
+print("[DEBUG L27] imported datetime")
 
 import requests
 print("[DEBUG L28] imported requests")
@@ -285,6 +287,44 @@ def parse_amount(value) -> float:
         return 0.0
 
 
+# Common date formats seen on statement exports. Tried in order until one
+# matches; unparseable dates fall back to sorting last rather than
+# crashing the sort.
+DATE_FORMATS = [
+    "%b %d",        # Jan 15
+    "%B %d",        # January 15
+    "%b %d, %Y",    # Jan 15, 2026
+    "%B %d, %Y",    # January 15, 2026
+    "%Y-%m-%d",      # 2026-01-15
+    "%m/%d/%Y",      # 01/15/2026
+    "%m/%d/%y",      # 01/15/26
+    "%d/%m/%Y",      # 15/01/2026
+]
+print("[DEBUG L268] set DATE_FORMATS")
+
+
+def parse_date_for_sort(date_str) -> datetime:
+    """
+    Best-effort parse of a date string into a datetime for sorting.
+    Falls back to datetime.max (sorts last) if no known format matches,
+    so a malformed/unusual date doesn't crash the sort -- it just ends
+    up at the bottom of its page's group, easy to spot for manual review.
+    """
+    print("[DEBUG L276] parse_date_for_sort: enter, date_str =", date_str)
+    if not date_str:
+        print("[DEBUG L278] parse_date_for_sort: empty date_str, returning datetime.max")
+        return datetime.max
+    for fmt in DATE_FORMATS:
+        try:
+            result = datetime.strptime(str(date_str).strip(), fmt)
+            print(f"[DEBUG L283] parse_date_for_sort: matched format '{fmt}' -> {result}")
+            return result
+        except ValueError:
+            continue
+    print("[DEBUG L287] parse_date_for_sort: no format matched, returning datetime.max")
+    return datetime.max
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -299,7 +339,7 @@ def main():
     pdf_path = sys.argv[1]
     print("[DEBUG L277] main: got pdf_path:", pdf_path)
 
-    print(f"Converting {pdf_path} to an image (dpi={PDF_DPI})...")
+    print(f"Converting {pdf_path} to images (dpi={PDF_DPI})...")
     print("[DEBUG L280] main: about to convert_from_path")
     pages = convert_from_path(pdf_path, dpi=PDF_DPI)
     print("[DEBUG L282] main: convert_from_path done")
@@ -307,90 +347,137 @@ def main():
         print("No pages found in PDF.")
         print("[DEBUG L285] main: no pages, exiting")
         sys.exit(1)
-    page = pages[0]
-    print("[DEBUG L288] main: got first page:", page)
+    print(f"[DEBUG L287] main: got {len(pages)} page(s)")
+    print(f"{len(pages)} page(s) found.\n")
 
-    print("Encoding image and sending to vision model for transcription...")
-    print("[DEBUG L291] main: about to encode_image")
-    img_b64 = encode_image(page)
-    print("[DEBUG L293] main: encode_image done")
+    # -------------------------------------------------------------------
+    # Stage 1: transcribe every page
+    # -------------------------------------------------------------------
 
-    start = time.time()
-    print("[DEBUG L296] main: set start time")
-    try:
-        print("[DEBUG L298] main: about to transcribe_page")
-        rows = transcribe_page(img_b64)
-        print("[DEBUG L300] main: transcribe_page done")
-    except requests.exceptions.Timeout:
-        print(f"[error] transcription request timed out after {REQUEST_TIMEOUT}s")
-        print("[DEBUG L303] main: timeout, exiting")
-        sys.exit(1)
-    except requests.exceptions.RequestException as e:
-        print(f"[error] transcription request failed: {e}")
-        print("[DEBUG L307] main: request error, exiting")
-        sys.exit(1)
-    transcribe_elapsed = time.time() - start
-    print("[DEBUG L310] main: computed transcribe_elapsed")
+    all_rows = []
+    transcribe_start = time.time()
+    print("[DEBUG L296] main: starting page transcription loop")
 
-    print(f"\n{len(rows)} row(s) transcribed in {transcribe_elapsed:.1f}s")
+    for i, page in enumerate(tqdm(pages, desc="Transcribing pages", unit="page")):
+        print(f"[DEBUG L300] main: processing page {i + 1}")
+        img_b64 = encode_image(page)
+        print(f"[DEBUG L302] main: encoded page {i + 1}")
+
+        try:
+            print(f"[DEBUG L305] main: about to transcribe_page for page {i + 1}")
+            rows = transcribe_page(img_b64)
+            print(f"[DEBUG L307] main: transcribe_page done for page {i + 1}, {len(rows)} row(s)")
+        except requests.exceptions.Timeout:
+            tqdm.write(f"[error] page {i + 1} timed out after {REQUEST_TIMEOUT}s, skipping")
+            print(f"[DEBUG L310] main: page {i + 1} timeout, skipping")
+            continue
+        except requests.exceptions.RequestException as e:
+            tqdm.write(f"[error] page {i + 1} request failed: {e}, skipping")
+            print(f"[DEBUG L313] main: page {i + 1} request error, skipping")
+            continue
+
+        for row in rows:
+            row["_page"] = i
+        all_rows.extend(rows)
+        tqdm.write(f"  page {i + 1}: {len(rows)} row(s) transcribed")
+
+    transcribe_elapsed = time.time() - transcribe_start
+    print("[DEBUG L322] main: computed transcribe_elapsed")
+    print(f"\n{len(all_rows)} row(s) transcribed across {len(pages)} page(s) in {transcribe_elapsed:.1f}s")
+
+    # -------------------------------------------------------------------
+    # Stage 2: classify every row across all pages
+    # -------------------------------------------------------------------
+
     print("Classifying each row with the local text model...")
-
     classify_start = time.time()
-    for row in tqdm(rows, desc="Classifying rows", unit="row"):
+    for row in tqdm(all_rows, desc="Classifying rows", unit="row"):
         row["confidence"] = classify_row(row)
     classify_elapsed = time.time() - classify_start
-    print(f"[DEBUG L319] main: classified {len(rows)} row(s) in {classify_elapsed:.1f}s")
+    print(f"[DEBUG L332] main: classified {len(all_rows)} row(s) in {classify_elapsed:.1f}s")
 
-    gas_rows = [r for r in rows if r["confidence"] >= GAS_CONFIDENCE_THRESHOLD]
-    gas_rows.sort(key=lambda r: r["confidence"], reverse=True)
-    print("[DEBUG L323] main: filtered and sorted gas_rows")
+    gas_rows = [r for r in all_rows if r["confidence"] >= GAS_CONFIDENCE_THRESHOLD]
+    gas_rows.sort(key=lambda r: (r.get("_page", 0), parse_date_for_sort(r.get("date", ""))))
+    print("[DEBUG L336] main: filtered and sorted gas_rows by page then date")
 
     total_elapsed = transcribe_elapsed + classify_elapsed
     print(f"\n{len(gas_rows)} gas row(s) found (threshold={GAS_CONFIDENCE_THRESHOLD}) -- total {total_elapsed:.1f}s")
-    print("[DEBUG L327] main: printed summary")
+    print("[DEBUG L340] main: printed summary")
 
-    print("[DEBUG L329] main: opening february_all_rows.json")
-    with open("february_all_rows.json", "w") as f:
-        print("[DEBUG L331] main: writing all rows")
-        json.dump(rows, f, indent=2)
-        print("[DEBUG L333] main: wrote all rows")
+    # -------------------------------------------------------------------
+    # Write outputs
+    # -------------------------------------------------------------------
 
-    print("[DEBUG L335] main: opening february_gas_receipts.json")
-    with open("february_gas_receipts.json", "w") as f:
-        print("[DEBUG L337] main: writing gas rows")
+    print(f"[DEBUG L346] main: opening {pdf_path.split('/')[-1].split('.')[0]}_all_rows.json")
+    with open(f"{pdf_path.split('/')[-1].split('.')[0]}_all_rows.json", "w") as f:
+        print("[DEBUG L348] main: writing all rows")
+        json.dump(all_rows, f, indent=2)
+        print("[DEBUG L350] main: wrote all rows")
+
+    print(f"[DEBUG L352] main: opening {pdf_path.split('/')[-1].split('.')[0]}_gas_receipts.json")
+    with open(f"{pdf_path.split('/')[-1].split('.')[0]}_gas_receipts.json", "w") as f:
+        print("[DEBUG L354] main: writing gas rows")
         json.dump(gas_rows, f, indent=2)
-        print("[DEBUG L339] main: wrote gas rows")
+        print("[DEBUG L356] main: wrote gas rows")
 
-    print("[DEBUG L341] main: opening summary.txt")
+    print(f"[DEBUG L358] main: opening summary_{pdf_path.split('/')[-1].split('.')[0]}.txt")
     gas_total = sum(parse_amount(r.get("amount")) for r in gas_rows)
-    print("[DEBUG L343] main: computed gas_total:", gas_total)
-    with open("summary.txt", "w") as f:
-        print("[DEBUG L345] main: writing summary header")
+    print("[DEBUG L360] main: computed gas_total:", gas_total)
+    with open(f"summary_{pdf_path.split('/')[-1].split('.')[0]}.txt", "w") as f:
+        print("[DEBUG L362] main: writing summary header")
         f.write(f"Source PDF: {pdf_path}\n")
-        f.write(f"Total rows transcribed: {len(rows)}\n")
+        f.write(f"Pages processed: {len(pages)}\n")
+        f.write(f"Total rows transcribed: {len(all_rows)}\n")
         f.write(f"Gas transactions found (confidence >= {GAS_CONFIDENCE_THRESHOLD * 100:.0f}%): {len(gas_rows)}\n")
         f.write(f"Transcription time: {transcribe_elapsed:.1f}s\n")
         f.write(f"Classification time: {classify_elapsed:.1f}s\n")
-        print("[DEBUG L351] main: wrote header lines")
+        print("[DEBUG L369] main: wrote header lines")
 
-        f.write("\nGas transactions:\n")
-        print("[DEBUG L354] main: writing gas transaction breakdown")
+        f.write("\nGas transactions (ordered by page, then date):\n\n")
+        print("[DEBUG L372] main: writing gas transaction breakdown with per-page subtotals")
+
+        DOTTED_LINE = "-" * 60
+        current_page = None
+        page_subtotal = 0.0
+        page_count = 0
+
         for r in gas_rows:
+            page_num = r.get("_page", "?")
+
+            if current_page is not None and page_num != current_page:
+                f.write(f"{DOTTED_LINE}\n")
+                f.write(f"  Page {current_page + 1} gas entr{'y' if page_count == 1 else 'ies'}: {page_count}\n")
+                f.write(f"  Page {current_page + 1} subtotal: ${page_subtotal:.2f}\n")
+                f.write(f"{DOTTED_LINE}\n\n")
+                print(f"[DEBUG L385] main: wrote subtotal for page {current_page}: {page_count} entries, ${page_subtotal:.2f}")
+                page_subtotal = 0.0
+                page_count = 0
+
+            current_page = page_num
             date = r.get("date", "")
             merchant = r.get("merchant", "")
             amount = parse_amount(r.get("amount"))
             confidence = r.get("confidence", 0.0)
-            f.write(f"  {date} | {merchant} | ${amount:.2f} | confidence: {confidence * 100:.0f}%\n")
-        print("[DEBUG L361] main: wrote all gas transaction lines")
+            f.write(f"  [page {page_num + 1}] {date} | {merchant} | ${amount:.2f} | confidence: {confidence * 100:.0f}%\n")
+            page_subtotal += amount
+            page_count += 1
+
+        if current_page is not None:
+            f.write(f"{DOTTED_LINE}\n")
+            f.write(f"  Page {current_page + 1} gas entr{'y' if page_count == 1 else 'ies'}: {page_count}\n")
+            f.write(f"  Page {current_page + 1} subtotal: ${page_subtotal:.2f}\n")
+            f.write(f"{DOTTED_LINE}\n\n")
+            
+        print("[DEBUG L380] main: wrote all gas transaction lines")
 
         f.write(f"\nTotal gas cost: ${gas_total:.2f}\n")
-        print("[DEBUG L364] main: wrote total gas cost line")
+        print("[DEBUG L383] main: wrote total gas cost line")
 
-    print("Output files: february_all_rows.json, february_gas_receipts.json, summary.txt")
-    print("[DEBUG L368] main: done")
+    print(f"Output files: {pdf_path.split('/')[-1].split('.')[0]}_all_rows.json, {pdf_path.split('/')[-1].split('.')[0]}_gas_receipts.json, summary_{pdf_path.split('/')[-1].split('.')[0]}.txt")
+    print("[DEBUG L387] main: done")
 
 
 if __name__ == "__main__":
-    print("[DEBUG L372] calling main()")
+    print("[DEBUG L391] calling main()")
     main()
-    print("[DEBUG L374] main() returned")
+    print("[DEBUG L393] main() returned")
